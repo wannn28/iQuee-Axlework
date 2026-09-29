@@ -1,7 +1,9 @@
 import { useMemo, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useApp } from '../store/app'
-import { DEPOTS, DRIVERS, TYPES, NOW, type Vehicle, type VehicleType } from '../data/fleet'
+import { DEPOTS, DRIVERS, TYPES, type Vehicle, type VehicleType } from '../data/fleet'
+import { api, useApi, type ApiError } from '../lib/api'
+import { ErrorPanel, LoadingPanel } from '../components/States'
 import { useTitle } from '../lib/useTitle'
 import { IArrowLeft, IAlert } from '../components/Icons'
 import NotFound from './NotFound'
@@ -16,12 +18,11 @@ const LABELS: Record<keyof FormState, string> = {
   depot: 'Home depot', driver: 'Assigned driver', tankGal: 'Tank capacity', imei: 'GPS tracker IMEI', fuelSensor: 'Fuel sensor', notes: 'Notes',
 }
 
-function validate(f: FormState, existing: Vehicle[], editingId?: string): Errors {
+function validate(f: FormState): Errors {
   const e: Errors = {}
   const id = f.id.trim().toUpperCase()
   if (!id) e.id = 'Required.'
   else if (!/^[A-Z]{2}-\d{3,4}$/.test(id)) e.id = 'Use the format HP-1234 (2 letters, dash, 3–4 digits).'
-  else if (id !== editingId && existing.some((v) => v.id === id)) e.id = `${id} is already in the fleet.`
   if (!f.plate.trim()) e.plate = 'Required.'
   else if (f.plate.trim().length < 4 || f.plate.trim().length > 10) e.plate = 'Plates are 4–10 characters.'
   const vin = f.vin.trim().toUpperCase()
@@ -41,7 +42,6 @@ function validate(f: FormState, existing: Vehicle[], editingId?: string): Errors
   else if (!(t >= 10 && t <= 400)) e.tankGal = 'Between 10 and 400 gal.'
   if (!f.imei.trim()) e.imei = 'Required to receive GPS data.'
   else if (!/^\d{15}$/.test(f.imei.trim())) e.imei = 'IMEI is 15 digits (found on the tracker label).'
-  else if (existing.some((v) => v.imei === f.imei.trim() && v.id !== editingId)) e.imei = 'This tracker is already paired with another unit.'
   if (f.notes.length > 280) e.notes = `Max 280 characters (${f.notes.length}).`
   return e
 }
@@ -67,65 +67,91 @@ function Section({ title, desc, children }: { title: string; desc: string; child
   )
 }
 
+interface DriverRow { id: number; name: string; vehicleId: string | null }
+const EMPTY: FormState = { id: '', plate: '', vin: '', make: '', model: '', year: '', type: '', depot: '', driver: '', tankGal: '', imei: '', fuelSensor: true, notes: '' }
+const toForm = (v: Vehicle): FormState => ({
+  id: v.id, plate: v.plate, vin: v.vin, make: v.make, model: v.model, year: String(v.year), type: v.type,
+  depot: v.depot, driver: v.driver ?? '', tankGal: String(v.tankGal), imei: v.imei, fuelSensor: v.fuelSensor, notes: v.notes,
+})
+
 export default function VehicleForm() {
   const { id } = useParams()
-  const { vehicles, saveVehicle, toast } = useApp()
+  const existing = useApi<Vehicle>(id ? `/vehicles/${encodeURIComponent(id)}` : null)
+  const drivers = useApi<DriverRow[]>('/drivers')
+  useTitle(id ? `Edit ${id}` : 'Add vehicle')
+  if (id && existing.error?.status === 404) return <NotFound />
+  if (id && !existing.data) return existing.error ? <ErrorPanel className="mx-auto max-w-[1000px]" error={existing.error} onRetry={existing.reload} /> : <LoadingPanel className="mx-auto max-w-[1000px]" label="Loading vehicle…" />
+  return <VehicleFormInner key={id ?? 'new'} editing={existing.data ?? undefined} drivers={drivers.data ?? []} />
+}
+
+function VehicleFormInner({ editing, drivers }: { editing?: Vehicle; drivers: DriverRow[] }) {
+  const { toast, refreshSummary } = useApp()
   const nav = useNavigate()
-  const editing = id ? vehicles.find((v) => v.id === id) : undefined
-  useTitle(editing ? `Edit ${editing.id}` : 'Add vehicle')
-  const initial = useMemo<FormState>(() => editing ? {
-    id: editing.id, plate: editing.plate, vin: editing.vin, make: editing.make, model: editing.model, year: String(editing.year), type: editing.type,
-    depot: editing.depot, driver: editing.driver ?? '', tankGal: String(editing.tankGal), imei: editing.imei, fuelSensor: editing.fuelSensor, notes: editing.notes,
-  } : { id: '', plate: '', vin: '', make: '', model: '', year: '', type: '', depot: '', driver: '', tankGal: '', imei: '', fuelSensor: true, notes: '' }, [editing])
+  const initial = useMemo<FormState>(() => (editing ? toForm(editing) : EMPTY), [editing])
   const [f, setF] = useState<FormState>(initial)
   const [touched, setTouched] = useState<Partial<Record<keyof FormState, boolean>>>({})
   const [submitted, setSubmitted] = useState(false)
-  if (id && !editing) return <NotFound />
+  const [serverErrors, setServerErrors] = useState<Errors>({})
+  const [saving, setSaving] = useState(false)
+  const [formError, setFormError] = useState('')
 
-  const errors = validate(f, vehicles, editing?.id)
+  const errors: Errors = { ...serverErrors, ...validate(f) }
   const show = (k: keyof FormState) => (touched[k] || submitted ? errors[k] : undefined)
   const errorList = Object.entries(errors) as [keyof FormState, string][]
-  const busyDrivers = new Set(vehicles.filter((v) => v.id !== editing?.id && v.driver).map((v) => v.driver))
+  const busyDrivers = new Set(drivers.filter((d) => d.vehicleId && d.vehicleId !== editing?.id).map((d) => d.name))
+  const driverNames = drivers.length ? drivers.map((d) => d.name) : DRIVERS
   const dirty = JSON.stringify(f) !== JSON.stringify(initial)
+  const edit = (k: keyof FormState, value: string | boolean) => {
+    setF((s) => ({ ...s, [k]: value }))
+    if (serverErrors[k]) setServerErrors((e) => { const n = { ...e }; delete n[k]; return n })
+  }
 
   const bind = (k: keyof FormState) => ({
     id: k, name: k, value: f[k] as string,
-    onChange: (e: { target: { value: string } }) => setF((s) => ({ ...s, [k]: e.target.value })),
+    onChange: (e: { target: { value: string } }) => edit(k, e.target.value),
     onBlur: () => setTouched((t) => ({ ...t, [k]: true })),
     'aria-invalid': show(k) ? true : undefined,
     'aria-describedby': show(k) ? `${k}-err` : undefined,
   })
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault()
     setSubmitted(true)
+    setFormError('')
     if (errorList.length) {
       document.getElementById('form-errors')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
       return
     }
-    const base: Vehicle = editing ?? {
-      id: '', plate: '', vin: '', make: '', model: '', year: 0, type: 'Tractor', depot: '', driver: null, status: 'parked', odometer: 0,
-      fuelLevel: 80, tankGal: 0, mpg: 0, speed: 0, location: '', lastSeen: new Date(NOW).toISOString(), imei: '', fuelSensor: true,
-      alerts: 0, health: 100, nextServiceMi: 15000, notes: '', createdAt: new Date().toISOString(),
+    const body = {
+      id: f.id.trim().toUpperCase(), plate: f.plate.trim().toUpperCase(), vin: f.vin.trim().toUpperCase(), make: f.make.trim(), model: f.model.trim(),
+      year: Number(f.year), type: f.type, depot: f.depot, driver: f.driver || null, tankGal: Number(f.tankGal), imei: f.imei.trim(),
+      fuelSensor: f.fuelSensor, notes: f.notes.trim(),
     }
-    const type = f.type as VehicleType
-    const v: Vehicle = {
-      ...base, id: f.id.trim().toUpperCase(), plate: f.plate.trim().toUpperCase(), vin: f.vin.trim().toUpperCase(), make: f.make.trim(), model: f.model.trim(),
-      year: Number(f.year), type, depot: f.depot, driver: f.driver || null, tankGal: Number(f.tankGal), imei: f.imei.trim(), fuelSensor: f.fuelSensor, notes: f.notes.trim(),
-      mpg: base.mpg || { Tractor: 7, 'Box truck': 10.5, Reefer: 8.8, 'Cargo van': 16.8, Pickup: 17.2 }[type],
-      location: base.location || `Depot yard · ${f.depot}`,
+    setSaving(true)
+    try {
+      const v = editing
+        ? await api<Vehicle>(`/vehicles/${encodeURIComponent(editing.id)}`, { method: 'PUT', body })
+        : await api<Vehicle>('/vehicles', { method: 'POST', body })
+      refreshSummary()
+      toast(editing ? `${v.id} updated` : `${v.id} added to the fleet`)
+      nav(`/vehicles/${v.id}`)
+    } catch (err) {
+      const ae = err as ApiError
+      if (ae.fields && Object.keys(ae.fields).length) {
+        setServerErrors(ae.fields as Errors)
+        setTimeout(() => document.getElementById('form-errors')?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 0)
+      } else setFormError(ae.message)
+      setSaving(false)
     }
-    saveVehicle(v)
-    toast(editing ? `${v.id} updated` : `${v.id} added to the fleet`)
-    nav(`/vehicles/${v.id}`)
   }
 
   return (
     <div className="mx-auto max-w-[1000px]">
       <Link to={editing ? `/vehicles/${editing.id}` : '/vehicles'} className="inline-flex items-center gap-1.5 text-[12.5px] font-semibold text-ink-2 hover:text-ink"><IArrowLeft size={15} /> {editing ? editing.id : 'Vehicles'}</Link>
       <h1 className="display mt-3 text-[28px] leading-tight sm:text-[32px]">{editing ? `Edit ${editing.id}` : 'Add a vehicle'}</h1>
-      <p className="mt-1 text-[13px] text-ink-2">{editing ? 'Changes are saved to this browser only.' : 'Register a unit and pair its GPS tracker. It will appear as parked at its home depot until the first packet arrives.'}</p>
+      <p className="mt-1 text-[13px] text-ink-2">{editing ? 'Changes are saved to the fleet database.' : 'Register a unit and pair its GPS tracker. It will appear as parked at its home depot until the first packet arrives.'}</p>
 
+      {formError && <div role="alert" className="mt-5 rounded-md border border-crit/40 bg-crit/5 p-4 text-[13px] font-semibold text-crit">{formError}</div>}
       {submitted && errorList.length > 0 && (
         <div id="form-errors" role="alert" className="mt-5 rounded-md border border-crit/40 bg-crit/5 p-4">
           <div className="flex items-center gap-2 text-[13px] font-bold text-crit"><IAlert size={16} /> {errorList.length} field{errorList.length > 1 ? 's' : ''} need attention</div>
@@ -172,7 +198,7 @@ export default function VehicleForm() {
           <Field name="driver" label="Assigned driver" hint="Optional. Drivers already on a unit are marked." error={show('driver')}>
             <select className="input" {...bind('driver')}>
               <option value="">Unassigned</option>
-              {DRIVERS.map((d) => <option key={d} value={d}>{d}{busyDrivers.has(d) ? ' · on another unit' : ''}</option>)}
+              {driverNames.map((d) => <option key={d} value={d}>{d}{busyDrivers.has(d) ? ' · on another unit' : ''}</option>)}
             </select>
           </Field>
         </Section>
@@ -182,7 +208,7 @@ export default function VehicleForm() {
           <Field name="tankGal" label="Tank capacity (gal)" hint="Combined, for dual-tank tractors" error={show('tankGal')}><input className="input num" inputMode="decimal" placeholder="150" {...bind('tankGal')} /></Field>
           <div className="sm:col-span-2">
             <label className="flex cursor-pointer items-start gap-3 rounded-[5px] border border-line p-3 hover:bg-sunk/60">
-              <input type="checkbox" className="check mt-0.5" checked={f.fuelSensor} onChange={(e) => setF((s) => ({ ...s, fuelSensor: e.target.checked }))} />
+              <input type="checkbox" className="check mt-0.5" checked={f.fuelSensor} onChange={(e) => edit('fuelSensor', e.target.checked)} />
               <span>
                 <span className="block text-[13px] font-semibold">Capacitive fuel-level sensor installed</span>
                 <span className="block text-[12px] text-ink-2">Enables tank-level charts, refuel reconciliation and sudden-drop (siphoning) alerts.</span>
@@ -190,7 +216,7 @@ export default function VehicleForm() {
             </label>
           </div>
           <Field name="notes" label="Notes" error={show('notes')} className="sm:col-span-2">
-            <textarea className="input h-24 resize-y py-2" placeholder="Anything dispatch should know — e.g. liftgate, reefer unit model, restricted routes." value={f.notes} onChange={(e) => setF((s) => ({ ...s, notes: e.target.value }))} onBlur={() => setTouched((t) => ({ ...t, notes: true }))} id="notes" aria-invalid={show('notes') ? true : undefined} />
+            <textarea className="input h-24 resize-y py-2" placeholder="Anything dispatch should know — e.g. liftgate, reefer unit model, restricted routes." value={f.notes} onChange={(e) => edit('notes', e.target.value)} onBlur={() => setTouched((t) => ({ ...t, notes: true }))} id="notes" aria-invalid={show('notes') ? true : undefined} />
             <div className={`num mt-1 text-right text-[11px] ${f.notes.length > 280 ? 'text-crit' : 'text-ink-3'}`}>{f.notes.length}/280</div>
           </Field>
         </Section>
@@ -199,7 +225,7 @@ export default function VehicleForm() {
         <div className="sticky bottom-0 -mx-5 flex items-center justify-end gap-2 rounded-b-md border-t border-line bg-surface/95 px-5 py-3 backdrop-blur sm:-mx-7 sm:px-7">
           <span className="mr-auto text-[12px] text-ink-3">{dirty ? 'Unsaved changes' : editing ? 'No changes' : ''}</span>
           <Link to={editing ? `/vehicles/${editing.id}` : '/vehicles'} className="btn-quiet">Cancel</Link>
-          <button className="btn-primary">{editing ? 'Save changes' : 'Add vehicle'}</button>
+          <button className="btn-primary" disabled={saving}>{saving ? 'Saving…' : editing ? 'Save changes' : 'Add vehicle'}</button>
         </div>
       </form>
     </div>

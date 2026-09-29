@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useApp, type Settings as S } from '../store/app'
 import { useTitle } from '../lib/useTitle'
 import { ISun, IMoon } from '../components/Icons'
@@ -33,9 +33,27 @@ function Group({ title, children }: { title: string; children: ReactNode }) {
 
 export default function Settings() {
   useTitle('Settings')
-  const { settings, setSettings, theme, setTheme, resetDemo, toast } = useApp()
+  const { settings, saveSettings, theme, setTheme, resetDemo, toast } = useApp()
   const [s, setS] = useState<S>(settings)
   const [confirm, setConfirm] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  // settings arrive from the API after mount; adopt them unless the user already started editing
+  const [base, setBase] = useState<S>(settings)
+  useEffect(() => {
+    if (JSON.stringify(settings) !== JSON.stringify(base)) {
+      setS((cur) => (JSON.stringify(cur) === JSON.stringify(base) ? settings : cur))
+      setBase(settings)
+    }
+  }, [settings, base])
+  const save = async () => {
+    setSaving(true)
+    try { await saveSettings(s); toast('Settings saved') } catch (e) { toast((e as Error).message) } finally { setSaving(false) }
+  }
+  const reset = async () => {
+    setResetting(true)
+    try { await resetDemo(); setConfirm(false); toast('Demo data restored') } catch (e) { toast((e as Error).message) } finally { setResetting(false) }
+  }
   const up = <K extends keyof S>(k: K, v: S[K]) => setS((x) => ({ ...x, [k]: v }))
   const dirty = JSON.stringify(s) !== JSON.stringify(settings)
   const emailOk = /^\S+@\S+\.\S+$/.test(s.email)
@@ -49,7 +67,7 @@ export default function Settings() {
   return (
     <div className="mx-auto max-w-[920px] pb-16">
       <h1 className="display text-[28px] leading-tight sm:text-[32px]">Settings</h1>
-      <p className="mt-1 text-[13px] text-ink-2">Workspace preferences and alert rules. Stored in this browser.</p>
+      <p className="mt-1 text-[13px] text-ink-2">Workspace preferences and alert rules, saved to your account on the server. Theme is stored in this browser.</p>
 
       <Group title="Profile">
         <Row title="Name"><input className="input max-w-sm" value={s.name} onChange={(e) => up('name', e.target.value)} aria-label="Name" /></Row>
@@ -99,10 +117,10 @@ export default function Settings() {
       </Group>
 
       <Group title="Demo data">
-        <Row title="Reset workspace" desc="Restores the seeded fleet, clears acknowledged alerts and settings.">
+        <Row title="Reset workspace" desc="Reloads the seeded fleet into the database, clears acknowledged alerts and restores default settings. Shared by all visitors; it also runs automatically every 24 h.">
           {confirm ? (
             <>
-              <button className="btn bg-crit text-white hover:bg-crit/90" onClick={() => { resetDemo(); setS(settings); setConfirm(false); toast('Demo data restored'); setTimeout(() => location.reload(), 400) }}>Yes, reset everything</button>
+              <button className="btn bg-crit text-white hover:bg-crit/90" disabled={resetting} onClick={reset}>{resetting ? 'Resetting…' : 'Yes, reset everything'}</button>
               <button className="btn-quiet" onClick={() => setConfirm(false)}>Cancel</button>
             </>
           ) : <button className="btn-ghost" onClick={() => setConfirm(true)}>Reset demo data</button>}
@@ -113,7 +131,7 @@ export default function Settings() {
         <div className="mx-auto flex max-w-[920px] items-center justify-end gap-2 px-4 py-3">
           <span className="mr-auto text-[12.5px] text-ink-2">You have unsaved changes</span>
           <button className="btn-quiet" onClick={() => setS(settings)}>Discard</button>
-          <button className="btn-primary" disabled={!emailOk} onClick={() => { setSettings(s); toast('Settings saved') }}>Save settings</button>
+          <button className="btn-primary" disabled={!emailOk || saving} onClick={save}>{saving ? 'Saving…' : 'Save settings'}</button>
         </div>
       </div>}
     </div>

@@ -1,0 +1,6 @@
+*.md
+.env
+.env.*
+/api
+/bin
+*.test

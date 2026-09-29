@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { SEED_FLEET, ALERTS, type Vehicle, type FleetAlert } from '../data/fleet'
+import type { Status } from '../data/fleet'
+import { api, getToken, setToken, setUnauthorizedHandler } from '../lib/api'
 
 export type Units = 'imperial' | 'metric'
 export type Theme = 'light' | 'dark'
@@ -31,49 +32,47 @@ export const DEFAULT_SETTINGS: Settings = {
   notifySms: false,
   dailyDigest: true,
 }
+export interface Summary { total: number; counts: Record<Status, number>; openAlerts: number }
 interface Toast { id: number; text: string }
+export type LoginInput = { demo: true } | { email: string; password: string }
 
 interface Ctx {
   authed: boolean
-  login: () => void
+  login: (input: LoginInput) => Promise<void>
   logout: () => void
   theme: Theme
   setTheme: (t: Theme) => void
-  vehicles: Vehicle[]
-  saveVehicle: (v: Vehicle) => void
-  deleteVehicles: (ids: string[]) => void
-  alerts: FleetAlert[]
-  ackAlert: (id: string) => void
+  /** fleet-wide counts for the sidebar / header; refreshed after every mutation */
+  summary: Summary | null
+  refreshSummary: () => void
   settings: Settings
-  setSettings: (s: Settings) => void
-  resetDemo: () => void
+  saveSettings: (s: Settings) => Promise<void>
+  resetDemo: () => Promise<void>
   toasts: Toast[]
   toast: (text: string) => void
 }
 const AppCtx = createContext<Ctx | null>(null)
-const VERSION = 'v1'
-function load<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(`axw.${key}`)
-    return raw ? (JSON.parse(raw) as T) : fallback
-  } catch {
-    return fallback
-  }
-}
-const save = (key: string, v: unknown) => {
-  try { localStorage.setItem(`axw.${key}`, typeof v === 'string' ? v : JSON.stringify(v)) } catch { /* private mode */ }
-}
 
 export function AppProvider({ children }: { children: ReactNode }) {
-  const [authed, setAuthed] = useState(() => load('authed', false))
+  const [authed, setAuthed] = useState(() => !!getToken())
   const [theme, setThemeState] = useState<Theme>(() => (localStorage.getItem('axw.theme') === 'dark' ? 'dark' : 'light'))
-  const [vehicles, setVehicles] = useState<Vehicle[]>(() => (load<string>('version', '') === VERSION ? load('vehicles', SEED_FLEET) : SEED_FLEET))
-  const [acked, setAcked] = useState<string[]>(() => load('acked', []))
-  const [settings, setSettingsState] = useState<Settings>(() => ({ ...DEFAULT_SETTINGS, ...load('settings', {}) }))
+  const [summary, setSummary] = useState<Summary | null>(null)
+  const [settings, setSettingsState] = useState<Settings>(DEFAULT_SETTINGS)
   const [toasts, setToasts] = useState<Toast[]>([])
 
-  useEffect(() => { document.documentElement.classList.toggle('dark', theme === 'dark'); save('theme', theme) }, [theme])
-  useEffect(() => { save('vehicles', vehicles); save('version', VERSION) }, [vehicles])
+  useEffect(() => { document.documentElement.classList.toggle('dark', theme === 'dark'); localStorage.setItem('axw.theme', theme) }, [theme])
+
+  const logout = useCallback(() => { setToken(null); setAuthed(false); setSummary(null) }, [])
+  useEffect(() => { setUnauthorizedHandler(logout); return () => setUnauthorizedHandler(null) }, [logout])
+
+  const refreshSummary = useCallback(() => {
+    api<Summary>('/fleet/summary').then(setSummary).catch(() => { /* sidebar keeps last value */ })
+  }, [])
+  useEffect(() => {
+    if (!authed) return
+    refreshSummary()
+    api<Settings>('/settings').then(setSettingsState).catch(() => { /* defaults until reachable */ })
+  }, [authed, refreshSummary])
 
   const toast = useCallback((text: string) => {
     const id = Date.now() + Math.random()
@@ -83,23 +82,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<Ctx>(() => ({
     authed,
-    login: () => { setAuthed(true); save('authed', true) },
-    logout: () => { setAuthed(false); save('authed', false) },
+    login: async (input) => {
+      const res = await api<{ token: string }>('/auth/login', { method: 'POST', body: input })
+      setToken(res.token)
+      setAuthed(true)
+    },
+    logout,
     theme,
     setTheme: setThemeState,
-    vehicles,
-    saveVehicle: (v) => setVehicles((all) => (all.some((x) => x.id === v.id) ? all.map((x) => (x.id === v.id ? v : x)) : [...all, v].sort((a, b) => a.id.localeCompare(b.id)))),
-    deleteVehicles: (ids) => setVehicles((all) => all.filter((v) => !ids.includes(v.id))),
-    alerts: ALERTS.map((a) => (acked.includes(a.id) ? { ...a, acknowledged: true } : a)),
-    ackAlert: (id) => setAcked((a) => { const n = [...a, id]; save('acked', n); return n }),
+    summary,
+    refreshSummary,
     settings,
-    setSettings: (s) => { setSettingsState(s); save('settings', s) },
-    resetDemo: () => {
-      setVehicles(SEED_FLEET); setAcked([]); save('acked', []); setSettingsState(DEFAULT_SETTINGS); save('settings', DEFAULT_SETTINGS)
+    saveSettings: async (s) => { setSettingsState(await api<Settings>('/settings', { method: 'PUT', body: s })) },
+    resetDemo: async () => {
+      await api('/demo/reset', { method: 'POST' })
+      setSettingsState(await api<Settings>('/settings'))
+      refreshSummary()
     },
     toasts,
     toast,
-  }), [authed, theme, vehicles, acked, settings, toasts, toast])
+  }), [authed, logout, theme, summary, refreshSummary, settings, toasts, toast])
 
   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>
 }

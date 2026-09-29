@@ -1,18 +1,18 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis, LabelList } from 'recharts'
 import { useApp } from '../store/app'
-import { DAYS, DEPOTS, STATUSES, STATUS_LABEL, ALERT_LABEL, NOW, type Status } from '../data/fleet'
+import { STATUS_LABEL, ALERT_LABEL, type Status, type FleetAlert } from '../data/fleet'
 import { useChartColors, ChartTip } from '../components/chart'
 import { Severity, STATUS_DOT } from '../components/Status'
 import { usd, num, compact, dist, distUnit, vol, volUnit, eff, effUnit, ago, day } from '../lib/format'
-import { toCSV, downloadCSV } from '../lib/csv'
+import { api, download, qs, useApi } from '../lib/api'
+import { ErrorPanel, LoadingPanel, Spinner } from '../components/States'
 import { useTitle } from '../lib/useTitle'
 import { IDownload, ICheck, IUp, IDown } from '../components/Icons'
 
 const RANGES = [7, 30, 90] as const
 type Range = (typeof RANGES)[number]
-const TARGET: Record<string, number> = { Tractor: 7.2, 'Box truck': 10.5, Reefer: 8.8, 'Cargo van': 17, Pickup: 17.5 }
 
 function Spark({ data, color }: { data: number[]; color: string }) {
   const max = Math.max(...data), min = Math.min(...data)
@@ -20,58 +20,73 @@ function Spark({ data, color }: { data: number[]; color: string }) {
   return <svg viewBox="0 0 100 28" preserveAspectRatio="none" className="h-7 w-full" aria-hidden><polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" vectorEffect="non-scaling-stroke" /></svg>
 }
 
+interface Totals { miles: number; gallons: number; fuelCost: number; idleHours: number; trips: number; alerts: number; onTime: number; mpg: number }
+interface Day { date: string; miles: number; gallons: number; fuelCost: number; idleHours: number; onTime: number; trips: number; alerts: number; prevMiles: number | null }
+interface OverviewData {
+  range: number
+  updatedAt: string
+  vehicleCount: number
+  depotCount: number
+  totals: { current: Totals; previous: Totals }
+  deltaPct: { miles: number; gallons: number; fuelCost: number; idleHours: number; mpg: number; onTimePts: number }
+  days: Day[]
+  depots: { depot: string; cost: number; units: number; perUnit: number }[]
+  status: { status: Status; count: number }[]
+  watchlist: { id: string; year: number; make: string; model: string; driver: string | null; depot: string; type: string; mpg: number; target: number; gap: number }[]
+}
+interface AlertsData { items: FleetAlert[]; open: number; total: number }
+
 export default function Overview() {
   useTitle('Overview')
-  const { vehicles, alerts, ackAlert, settings, toast } = useApp()
+  const { settings, toast, refreshSummary } = useApp()
   const c = useChartColors()
   const u = settings.units
   const [range, setRange] = useState<Range>(30)
   const loc = useLocation()
+  const ov = useApi<OverviewData>(`/overview?range=${range}`)
+  const al = useApi<AlertsData>('/alerts?limit=9')
   useEffect(() => {
-    if (loc.hash === '#alerts') setTimeout(() => document.getElementById('alerts')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
-  }, [loc.hash])
+    if (loc.hash === '#alerts' && al.data) setTimeout(() => document.getElementById('alerts')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+  }, [loc.hash, al.data])
 
-  const cur = DAYS.slice(-range)
-  const prev = DAYS.slice(-range * 2, -range)
-  const sum = (arr: typeof DAYS, k: 'miles' | 'gallons' | 'fuelCost' | 'idleHours' | 'trips') => arr.reduce((s, d) => s + d[k], 0)
-  const avg = (arr: typeof DAYS) => arr.reduce((s, d) => s + d.onTime, 0) / arr.length
+  if (!ov.data) return ov.error ? <ErrorPanel className="mx-auto max-w-[1400px]" error={ov.error} onRetry={ov.reload} /> : <LoadingPanel className="mx-auto max-w-[1400px]" label="Loading fleet overview…" />
+  const o = ov.data
+  const cur = o.days
+  const T = o.totals.current, D = o.deltaPct
+  const kpis = [
+    { label: 'Distance', value: compact(dist(T.miles, u)), unit: distUnit(u), delta: D.miles, good: 'up', spark: cur.map((x) => x.miles) },
+    { label: 'Fuel used', value: compact(vol(T.gallons, u)), unit: volUnit(u), delta: D.gallons, good: 'neutral', spark: cur.map((x) => x.gallons) },
+    { label: 'Fuel spend', value: usd(T.fuelCost), unit: '', delta: D.fuelCost, good: 'down', spark: cur.map((x) => x.fuelCost) },
+    { label: 'Fleet efficiency', value: num(eff(T.mpg, u), 2), unit: effUnit(u), delta: D.mpg * (u === 'metric' ? -1 : 1), good: u === 'metric' ? 'down' : 'up', spark: cur.map((x) => x.miles / x.gallons) },
+    { label: 'On-time stops', value: T.onTime.toFixed(1), unit: '%', delta: D.onTimePts, good: 'up', pts: true, spark: cur.map((x) => x.onTime) },
+    { label: 'Engine idle', value: num(T.idleHours), unit: 'h', delta: D.idleHours, good: 'down', spark: cur.map((x) => x.idleHours) },
+  ]
 
-  const kpis = useMemo(() => {
-    const m = sum(cur, 'miles'), pm = sum(prev, 'miles')
-    const g = sum(cur, 'gallons'), pg = sum(prev, 'gallons')
-    const f = sum(cur, 'fuelCost'), pf = sum(prev, 'fuelCost')
-    const idle = sum(cur, 'idleHours'), pidle = sum(prev, 'idleHours')
-    const ot = avg(cur), pot = avg(prev)
-    const d = (a: number, b: number) => ((a - b) / b) * 100
-    return [
-      { label: 'Distance', value: compact(dist(m, u)), unit: distUnit(u), delta: d(m, pm), good: 'up', spark: cur.map((x) => x.miles) },
-      { label: 'Fuel used', value: compact(vol(g, u)), unit: volUnit(u), delta: d(g, pg), good: 'neutral', spark: cur.map((x) => x.gallons) },
-      { label: 'Fuel spend', value: usd(f), unit: '', delta: d(f, pf), good: 'down', spark: cur.map((x) => x.fuelCost) },
-      { label: 'Fleet efficiency', value: num(eff(m / g, u), 2), unit: effUnit(u), delta: d(m / g, pm / pg) * (u === 'metric' ? -1 : 1), good: u === 'metric' ? 'down' : 'up', spark: cur.map((x) => x.miles / x.gallons) },
-      { label: 'On-time stops', value: ot.toFixed(1), unit: '%', delta: ot - pot, good: 'up', pts: true, spark: cur.map((x) => x.onTime) },
-      { label: 'Engine idle', value: num(idle), unit: 'h', delta: d(idle, pidle), good: 'down', spark: cur.map((x) => x.idleHours) },
-    ]
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [range, u])
-
-  const series = cur.map((d, i) => ({ date: d.date, miles: Math.round(dist(d.miles, u)), prev: prev[i] ? Math.round(dist(prev[i].miles, u)) : null }))
-  const depotData = DEPOTS.map((dp) => ({ depot: dp, cost: cur.reduce((s, d) => s + d.byDepot[dp], 0), units: vehicles.filter((v) => v.depot === dp).length }))
-    .map((x) => ({ ...x, perUnit: x.units ? x.cost / x.units : 0 })).sort((a, b) => b.cost - a.cost)
-  const statusData = STATUSES.map((s) => ({ s, name: STATUS_LABEL[s], value: vehicles.filter((v) => v.status === s).length }))
+  // dates come as YYYY-MM-DD (fleet-local); pin to noon so every browser time zone shows the same day
+  const series = cur.map((d) => ({ date: `${d.date}T12:00:00`, miles: Math.round(dist(d.miles, u)), prev: d.prevMiles != null ? Math.round(dist(d.prevMiles, u)) : null }))
+  const depotData = o.depots
+  const statusData = o.status.map((x) => ({ s: x.status, name: STATUS_LABEL[x.status], value: x.count }))
+  const total = Math.max(1, o.vehicleCount)
   const statusColor: Record<Status, string> = { moving: c.ok, idle: c.signal, parked: c.ink3, maintenance: c.warn, offline: c.crit }
-  const watch = vehicles.filter((v) => v.status !== 'maintenance')
-    .map((v) => ({ v, gap: (v.mpg - TARGET[v.type]) / TARGET[v.type] }))
-    .sort((a, b) => a.gap - b.gap).slice(0, 6)
-  const openAlerts = alerts.filter((a) => !a.acknowledged)
-  const recent = alerts.slice(0, 9)
+  const watch = o.watchlist.map((v) => ({ v, gap: v.gap }))
+  const alerts = al.data?.items ?? []
+  const openCount = al.data?.open ?? 0
+  const recent = alerts
   const onRoad = statusData[0].value + statusData[1].value
 
-  const exportReport = () => {
-    downloadCSV(`axlework-daily-${range}d.csv`, toCSV(cur.map((d) => ({
-      date: d.date.slice(0, 10), [`distance_${distUnit(u)}`]: Math.round(dist(d.miles, u)), [`fuel_${volUnit(u)}`]: Math.round(vol(d.gallons, u)),
-      fuel_cost_usd: d.fuelCost, idle_hours: d.idleHours, trips: d.trips, on_time_pct: d.onTime, alerts: d.alerts,
-    }))))
-    toast(`Exported ${cur.length} days as CSV`)
+  const ackAlert = async (id: string) => {
+    try {
+      const updated = await api<FleetAlert>(`/alerts/${id}/ack`, { method: 'POST' })
+      al.setData((d) => d && { ...d, open: Math.max(0, d.open - 1), items: d.items.map((a) => (a.id === id ? updated : a)) })
+      refreshSummary()
+      toast(`${id} acknowledged`)
+    } catch (e) { toast((e as Error).message) }
+  }
+  const exportReport = async () => {
+    try {
+      const n = await download(`/reports/daily.csv${qs({ range, units: u })}`, `axlework-daily-${range}d.csv`)
+      toast(`Exported ${n} days as CSV`)
+    } catch (e) { toast((e as Error).message) }
   }
   const tickDate = (v: string) => day(v)
 
@@ -81,10 +96,11 @@ export default function Overview() {
         <div>
           <h1 className="display text-[28px] leading-tight sm:text-[32px]">Operations overview</h1>
           <p className="mt-1 text-[13px] text-ink-2">
-            {vehicles.length} units across {DEPOTS.length} depots · <span className="num">{onRoad}</span> on the road right now · updated {new Date(NOW).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
+            {o.vehicleCount} units across {o.depotCount} depots · <span className="num">{onRoad}</span> on the road right now · updated {new Date(o.updatedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {ov.loading && <Spinner />}
           <div className="seg" role="group" aria-label="Date range">
             {RANGES.map((r) => <button key={r} aria-pressed={range === r} onClick={() => setRange(r)}>{r === 7 ? '7 days' : r === 30 ? '30 days' : '90 days'}</button>)}
           </div>
@@ -150,7 +166,7 @@ export default function Overview() {
                 </PieChart>
               </ResponsiveContainer>
               <div className="pointer-events-none absolute inset-0 grid place-content-center text-center">
-                <div className="num text-[30px] font-semibold leading-none">{Math.round((onRoad / vehicles.length) * 100)}%</div>
+                <div className="num text-[30px] font-semibold leading-none">{Math.round((onRoad / total) * 100)}%</div>
                 <div className="mt-1 text-[11px] text-ink-3">utilisation</div>
               </div>
             </div>
@@ -161,7 +177,7 @@ export default function Overview() {
                     <span className={`h-2.5 w-2.5 rounded-[2px] ${STATUS_DOT[d.s]}`} />
                     <span className="text-ink-2">{d.name}</span>
                     <span className="num ml-auto font-semibold">{d.value}</span>
-                    <span className="num w-10 text-right text-[11.5px] text-ink-3">{Math.round((d.value / vehicles.length) * 100)}%</span>
+                    <span className="num w-10 text-right text-[11.5px] text-ink-3">{Math.round((d.value / total) * 100)}%</span>
                   </Link>
                 </li>
               ))}
@@ -171,10 +187,12 @@ export default function Overview() {
 
         <section id="alerts" className="panel scroll-mt-20 xl:col-span-7">
           <div className="panel-head">
-            <div className="flex items-center gap-2 panel-title">Alerts <span className="num rounded-[3px] bg-crit px-1.5 text-[11px] font-bold text-white">{openAlerts.length} open</span></div>
+            <div className="flex items-center gap-2 panel-title">Alerts <span className="num rounded-[3px] bg-crit px-1.5 text-[11px] font-bold text-white">{openCount} open</span></div>
             <span className="text-[11.5px] text-ink-3">GPS + fuel sensor rules · last 6 days</span>
           </div>
           <ul className="divide-y divide-line">
+            {al.error && <li className="px-4 py-6 text-center text-[12.5px] text-crit">{al.error.message} <button className="font-semibold underline" onClick={al.reload}>Retry</button></li>}
+            {!al.data && !al.error && <li className="px-4 py-6 text-center text-[12.5px] text-ink-3">Loading alerts…</li>}
             {recent.map((a) => (
               <li key={a.id} className={`grid grid-cols-[auto_1fr_auto] items-start gap-x-3 px-4 py-2.5 ${a.acknowledged ? 'opacity-55' : ''}`}>
                 <div className="pt-0.5"><Severity s={a.severity} /></div>
@@ -190,7 +208,7 @@ export default function Overview() {
                   {a.acknowledged ? (
                     <span className="grid h-7 w-7 place-items-center text-ok" title="Acknowledged"><ICheck size={15} /></span>
                   ) : (
-                    <button className="btn-ghost btn-sm" onClick={() => { ackAlert(a.id); toast(`${a.id} acknowledged`) }}>Ack</button>
+                    <button className="btn-ghost btn-sm" onClick={() => ackAlert(a.id)}>Ack</button>
                   )}
                 </div>
               </li>
@@ -247,7 +265,7 @@ export default function Overview() {
                     <td className="px-4 py-2">{v.driver ?? <span className="text-ink-3">Unassigned</span>}</td>
                     <td className="px-4 py-2 text-ink-2">{v.depot}</td>
                     <td className="num px-4 py-2 text-right font-semibold">{eff(v.mpg, u).toFixed(1)}</td>
-                    <td className="num px-4 py-2 text-right text-ink-3">{eff(TARGET[v.type], u).toFixed(1)}</td>
+                    <td className="num px-4 py-2 text-right text-ink-3">{eff(v.target, u).toFixed(1)}</td>
                     <td className="px-4 py-2">
                       <div className="flex items-center justify-end gap-2">
                         <span className="relative h-1.5 w-24 overflow-hidden rounded-full bg-sunk"><span className="absolute inset-y-0 right-0 bg-crit" style={{ width: `${Math.min(100, Math.abs(gap) * 400)}%` }} /></span>

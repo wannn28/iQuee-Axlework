@@ -1,14 +1,16 @@
-import { useMemo, type ReactNode } from 'react'
+import { type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { Area, AreaChart, CartesianGrid, ReferenceArea, ReferenceDot, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { useApp } from '../store/app'
-import { vehicleDetail, type TLKind } from '../data/detail'
-import { STATUS_LABEL } from '../data/fleet'
+import type { TLKind, Route, FuelPoint, TLItem, Service } from '../data/detail'
+import { STATUS_LABEL, type Vehicle } from '../data/fleet'
 import { RouteMap } from '../components/RouteMap'
 import { StatusBadge } from '../components/Status'
 import { ChartTip, useChartColors } from '../components/chart'
 import { usd, num, dist, distUnit, vol, volUnit, eff, effUnit, speed, speedUnit, ago, time, dayFull } from '../lib/format'
 import { toCSV, downloadCSV } from '../lib/csv'
+import { useApi } from '../lib/api'
+import { ErrorPanel, LoadingPanel } from '../components/States'
 import { useTitle } from '../lib/useTitle'
 import { IArrowLeft, IEdit, IDownload, IFuel, IAlert } from '../components/Icons'
 import NotFound from './NotFound'
@@ -18,15 +20,35 @@ const TL_STYLE: Record<TLKind, string> = {
   overspeed: 'bg-warn', idle: 'bg-warn', drop: 'bg-crit', brake: 'bg-warn', off: 'bg-ink-3',
 }
 
+interface DetailResponse {
+  vehicle: Vehicle
+  trip: { route: Route; today: { miles: number; engineHours: number; idleMin: number; maxSpeed: number; score: number }; progress: number; active: boolean } | null
+  fuel: { readings: FuelPoint[]; drop: { from: string; to: string; gal: number; pct: number } | null; thresholdGal: number }
+  timeline: TLItem[]
+  services: Service[]
+}
+const EMPTY_ROUTE: Route = { path: [], stops: [], current: null, driven: [], miles: 0 }
+
 export default function VehicleDetail() {
   const { id } = useParams()
-  const { vehicles, settings, toast } = useApp()
+  const { settings, toast } = useApp()
   const c = useChartColors()
   const u = settings.units
-  const v = vehicles.find((x) => x.id === id)
-  useTitle(v ? v.id : 'Not found')
-  const d = useMemo(() => (v ? vehicleDetail(v) : null), [v])
-  if (!v || !d) return <NotFound />
+  const res = useApi<DetailResponse>(`/vehicles/${encodeURIComponent(id ?? '')}/detail`)
+  const v = res.data?.vehicle
+  useTitle(v ? v.id : res.error?.status === 404 ? 'Not found' : 'Vehicle')
+  if (res.error?.status === 404) return <NotFound />
+  if (!res.data || !v) return res.error ? <ErrorPanel className="mx-auto max-w-[1400px]" error={res.error} onRetry={res.reload} /> : <LoadingPanel className="mx-auto max-w-[1400px]" label="Loading vehicle…" />
+  const r = res.data
+  const d = {
+    route: r.trip?.route ?? EMPTY_ROUTE,
+    today: r.trip?.today ?? { miles: 0, engineHours: 0, idleMin: 0, maxSpeed: 0, score: 100 },
+    active: r.trip?.active ?? false,
+    fuel: r.fuel.readings,
+    drop: r.fuel.drop,
+    timeline: r.timeline,
+    services: r.services,
+  }
 
   const fuelData = d.fuel.map((p) => ({ t: p.t, level: p.level }))
   const dropPoint = d.drop ? fuelData.find((p) => p.t === d.drop!.to) : null
@@ -96,7 +118,7 @@ export default function VehicleDetail() {
               </div>
             </div>
             <RouteMap route={d.route} />
-            <div className="border-t border-line px-4 py-2 text-[11px] text-ink-3">Schematic map · positions are simulated from seeded GPS data, no map provider used.</div>
+            <div className="border-t border-line px-4 py-2 text-[11px] text-ink-3">Schematic map · route points and stops come from PostgreSQL (seeded GPS replay), no map provider used.</div>
           </section>
 
           <section className="panel">
@@ -105,7 +127,7 @@ export default function VehicleDetail() {
               {d.drop ? (
                 <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold text-crit"><span className="h-2 w-2 rounded-full bg-crit" />Drop of {num(vol(d.drop.gal, u))} {volUnit(u)} at {time(d.drop.from)}</span>
               ) : (
-                <span className="text-[12px] text-ink-3">{v.fuelSensor ? 'No anomalies' : 'No sensor installed'}</span>
+                <span className="text-[12px] text-ink-3">{v.fuelSensor ? `No drops ≥ ${num(vol(r.fuel.thresholdGal, u))} ${volUnit(u)}` : 'No sensor installed'}</span>
               )}
             </div>
             {v.fuelSensor ? (
