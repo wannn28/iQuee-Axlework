@@ -1,0 +1,57 @@
+# Axlework: Go API + PostgreSQL 16. The SPA itself is static files served by the host's nginx,
+# which also reverse-proxies /api/ to 127.0.0.1:${API_PORT}.
+#   cp .env.example .env   # then fill in secrets
+#   docker compose up -d --build
+name: iquee-axlework
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: axlework
+      POSTGRES_USER: axlework
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axlework -d axlework"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 384m
+    logging: &logging
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    # no "ports:" on purpose - the database is reachable only from the api container
+
+  api:
+    build:
+      context: ./server
+      args:
+        VERSION: ${API_VERSION:-1.0.0}
+    image: iquee-axlework-api:${API_VERSION:-1.0.0}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://axlework:${POSTGRES_PASSWORD}@db:5432/axlework?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      JWT_TTL: ${JWT_TTL:-12h}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://axlework.iquee.tech}
+      DEMO_EMAIL: ${DEMO_EMAIL:-alex.moreno@harborpine.example}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-demo-password}
+      DEMO_RESET_EVERY: ${DEMO_RESET_EVERY:-24h}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:${API_PORT:-8009}:8080"   # loopback only; nginx is the public entry point
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    logging: *logging
+
+volumes:
+  pgdata:

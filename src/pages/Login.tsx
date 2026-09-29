@@ -17,6 +17,7 @@ export default function Login() {
   const [email, setEmail] = useState('alex.moreno@harborpine.example')
   const [pw, setPw] = useState('demo-password')
   const [err, setErr] = useState('')
+  const [busy, setBusy] = useState<'' | 'demo' | 'form'>('')
   const hero = useMemo(() => {
     const v = SEED_FLEET.find((x) => x.status === 'moving' && x.type === 'Tractor') ?? SEED_FLEET[0]
     const dropUnit = SEED_FLEET.find((x) => x.type === 'Reefer' && x.fuelSensor)?.id ?? SEED_FLEET[1].id
@@ -24,13 +25,23 @@ export default function Login() {
   }, [])
   if (authed) return <Navigate to={from} replace />
 
+  const go = async (kind: 'demo' | 'form') => {
+    setBusy(kind); setErr('')
+    try {
+      await login(kind === 'demo' ? { demo: true } : { email, password: pw })
+      nav(from, { replace: true })
+    } catch (e) {
+      setErr((e as Error).message)
+      setBusy('')
+    }
+  }
   const submit = (e: FormEvent) => {
     e.preventDefault()
-    if (!/^\S+@\S+\.\S+$/.test(email)) return setErr('Enter an email address — any address works in the demo.')
-    if (!pw) return setErr('Enter any password.')
-    login(); nav(from, { replace: true })
+    if (!/^\S+@\S+\.\S+$/.test(email)) return setErr('Enter a valid email address.')
+    if (!pw) return setErr('Enter your password.')
+    go('form')
   }
-  const enter = () => { login(); nav(from, { replace: true }) }
+  const enter = () => go('demo')
 
   return (
     <div className="grid min-h-screen lg:grid-cols-[minmax(420px,5fr)_7fr]">
@@ -39,9 +50,9 @@ export default function Login() {
         <div className="my-auto w-full max-w-sm py-12">
           <p className="label">Fleet & fuel operations</p>
           <h1 className="display mt-3 text-[34px] leading-[1.05]">Sign in to your yard.</h1>
-          <p className="mt-3 text-[14px] leading-relaxed text-ink-2">This is a demo workspace for <b className="text-ink font-semibold">Harbor & Pine Freight</b>, a fictional 68-vehicle carrier in the Pacific Northwest. Any email and password will do.</p>
+          <p className="mt-3 text-[14px] leading-relaxed text-ink-2">This is a demo workspace for <b className="text-ink font-semibold">Harbor & Pine Freight</b>, a fictional 68-vehicle carrier in the Pacific Northwest. Sign in with the prefilled demo account (<span className="num text-[12.5px]">demo-password</span>) or jump straight in.</p>
 
-          <button onClick={enter} className="btn-signal mt-7 h-11 w-full text-[14px]">Enter demo — no account needed</button>
+          <button onClick={enter} disabled={!!busy} className="btn-signal mt-7 h-11 w-full text-[14px]">{busy === 'demo' ? 'Signing in…' : 'Enter demo — no account needed'}</button>
           <div className="my-6 flex items-center gap-3 text-[11px] text-ink-3"><span className="h-px flex-1 bg-line" />or sign in<span className="h-px flex-1 bg-line" /></div>
 
           <form onSubmit={submit} noValidate className="space-y-4">
@@ -54,10 +65,10 @@ export default function Login() {
               <input className="input mt-1.5 h-10" type="password" value={pw} onChange={(e) => { setPw(e.target.value); setErr('') }} autoComplete="current-password" />
             </label>
             {err && <p className="text-[12.5px] text-crit" role="alert">{err}</p>}
-            <button className="btn-primary h-10 w-full">Sign in</button>
+            <button className="btn-primary h-10 w-full" disabled={!!busy}>{busy === 'form' ? 'Signing in…' : 'Sign in'}</button>
           </form>
         </div>
-        <p className="text-[11.5px] text-ink-3">Portfolio demo by <a className="underline underline-offset-2" href="https://iquee.tech">iQuee</a> · seeded mock data, nothing is stored on a server.</p>
+        <p className="text-[11.5px] text-ink-3">Portfolio demo by <a className="underline underline-offset-2" href="https://iquee.tech">iQuee</a> · seeded mock data served by a Go + PostgreSQL API, reset every 24 h.</p>
       </div>
 
       <div className="relative hidden overflow-hidden border-l border-line bg-sunk lg:flex lg:flex-col lg:justify-between p-12 xl:p-16">

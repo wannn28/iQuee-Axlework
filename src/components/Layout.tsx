@@ -14,8 +14,9 @@ const NAV = [
 ]
 
 function Sidebar({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: () => void }) {
-  const { vehicles, logout, settings } = useApp()
-  const counts = STATUSES.map((s) => ({ s, n: vehicles.filter((v) => v.status === s).length }))
+  const { summary, logout, settings } = useApp()
+  const counts = STATUSES.map((s) => ({ s, n: summary?.counts[s] ?? 0 }))
+  const total = summary?.total ?? 0
   const onRoad = counts[0].n + counts[1].n
   const isNewPage = useLocation().pathname === '/vehicles/new'
   return (
@@ -47,7 +48,7 @@ function Sidebar({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: (
               <>
                 <Icon size={17} className={isActive ? 'text-signal' : ''} />
                 {!collapsed && <span>{label}</span>}
-                {!collapsed && to === '/vehicles' && <span className={`ml-auto num text-[11px] ${isActive ? 'text-bg/70' : 'text-ink-3'}`}>{vehicles.length}</span>}
+                {!collapsed && to === '/vehicles' && <span className={`ml-auto num text-[11px] ${isActive ? 'text-bg/70' : 'text-ink-3'}`}>{summary ? total : '…'}</span>}
               </>
             ) }}
           </NavLink>
@@ -59,7 +60,7 @@ function Sidebar({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: (
           <div className="mx-5 mb-4 border-t border-line pt-4">
             <div className="flex items-baseline justify-between">
               <span className="label">On the road</span>
-              <span className="num text-xs"><b className="text-ink">{onRoad}</b><span className="text-ink-3">/{vehicles.length}</span></span>
+              <span className="num text-xs"><b className="text-ink">{onRoad}</b><span className="text-ink-3">/{total}</span></span>
             </div>
             <div className="mt-2 flex h-2 overflow-hidden rounded-[2px] gap-px">
               {counts.map(({ s, n }) => n > 0 && <span key={s} className={STATUS_DOT[s]} style={{ flex: n }} title={`${STATUS_LABEL[s]}: ${n}`} />)}
@@ -86,7 +87,7 @@ function Sidebar({ collapsed, onNavigate }: { collapsed: boolean; onNavigate?: (
 const CRUMB: Record<string, string> = { '': 'Overview', vehicles: 'Vehicles', new: 'New', edit: 'Edit', settings: 'Settings' }
 
 export function Layout() {
-  const { theme, setTheme, alerts, settings, toasts } = useApp()
+  const { theme, setTheme, summary, refreshSummary, settings, toasts } = useApp()
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('axw.collapsed') === '1')
   const [mobileOpen, setMobileOpen] = useState(false)
   const [q, setQ] = useState('')
@@ -94,7 +95,9 @@ export function Layout() {
   const nav = useNavigate()
   useEffect(() => { localStorage.setItem('axw.collapsed', collapsed ? '1' : '0') }, [collapsed])
   useEffect(() => { setMobileOpen(false); window.scrollTo(0, 0) }, [loc.pathname])
-  const open = alerts.filter((a) => !a.acknowledged).length
+  // keep sidebar counts and the alert badge fresh while navigating
+  useEffect(() => { refreshSummary() }, [loc.pathname, refreshSummary])
+  const open = summary?.openAlerts ?? 0
   const parts = loc.pathname.split('/').filter(Boolean)
   const initials = settings.name.split(' ').map((w) => w[0]).slice(0, 2).join('')
 
@@ -138,7 +141,7 @@ export function Layout() {
             <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Find unit, plate, driver…" className="input h-8 pl-8" aria-label="Search vehicles" />
           </form>
           <Link to="/vehicles" className="btn-quiet ml-auto px-2 sm:hidden" aria-label="Search vehicles"><ISearch size={17} /></Link>
-          <span className="inline-flex h-6 items-center rounded-[3px] border border-dashed border-signal-text/60 bg-signal-soft px-2 text-[10.5px] font-bold uppercase tracking-label text-signal-text" title="All numbers are generated from a fixed seed. Nothing here is real.">
+          <span className="inline-flex h-6 items-center rounded-[3px] border border-dashed border-signal-text/60 bg-signal-soft px-2 text-[10.5px] font-bold uppercase tracking-label text-signal-text" title="Seeded demo dataset served from PostgreSQL by a Go API. Nothing here is real; it resets every 24 h.">
             Demo data
           </span>
           <button className="btn-quiet px-2" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} aria-label="Toggle dark mode" title="Toggle theme">
@@ -156,7 +159,7 @@ export function Layout() {
         </main>
         <footer className="border-t border-line px-3 py-4 text-[11.5px] text-ink-3 sm:px-6 lg:px-8 flex flex-wrap gap-x-4 gap-y-1">
           <span>Axlework is a portfolio demo by <a href="https://iquee.tech" className="underline decoration-line-strong underline-offset-2 hover:text-ink">iQuee</a>.</span>
-          <span>All vehicles, people and numbers are seeded mock data.</span>
+          <span>All vehicles, people and numbers are seeded mock data, served live from a Go + PostgreSQL API.</span>
         </footer>
       </div>
 

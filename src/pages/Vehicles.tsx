@@ -1,20 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useApp } from '../store/app'
-import { DEPOTS, STATUSES, STATUS_LABEL, TYPES, type Vehicle } from '../data/fleet'
+import { DEPOTS, STATUSES, STATUS_LABEL, TYPES, type Status, type Vehicle } from '../data/fleet'
 import { StatusBadge, FuelBar, STATUS_DOT } from '../components/Status'
-import { ago, dist, distUnit, eff, effUnit, num } from '../lib/format'
-import { toCSV, downloadCSV } from '../lib/csv'
+import { ago, dist, eff, effUnit, num } from '../lib/format'
+import { api, download, qs, useApi } from '../lib/api'
+import { Spinner } from '../components/States'
 import { useTitle } from '../lib/useTitle'
 import { ISearch, IDownload, IPlus, IUp, IDown, ISort, IChevron, IChevronLeft, ITrash, IX } from '../components/Icons'
 
 type SortKey = 'id' | 'vehicle' | 'status' | 'driver' | 'depot' | 'fuelLevel' | 'odometer' | 'mpg' | 'lastSeen' | 'alerts'
-const STATUS_ORDER = Object.fromEntries(STATUSES.map((s, i) => [s, i]))
-const getters: Record<SortKey, (v: Vehicle) => string | number> = {
-  id: (v) => v.id, vehicle: (v) => `${v.make} ${v.model}`, status: (v) => STATUS_ORDER[v.status], driver: (v) => v.driver ?? '~',
-  depot: (v) => v.depot, fuelLevel: (v) => v.fuelLevel, odometer: (v) => v.odometer, mpg: (v) => v.mpg,
-  lastSeen: (v) => -new Date(v.lastSeen).getTime(), alerts: (v) => v.alerts,
-}
+interface ListResponse { items: Vehicle[]; total: number; page: number; size: number; pages: number; counts: Record<Status, number>; fleetTotal: number }
 
 function IndeterminateCheck({ checked, indeterminate, onChange, label }: { checked: boolean; indeterminate: boolean; onChange: () => void; label: string }) {
   const ref = useRef<HTMLInputElement>(null)
@@ -24,7 +20,7 @@ function IndeterminateCheck({ checked, indeterminate, onChange, label }: { check
 
 export default function Vehicles() {
   useTitle('Vehicles')
-  const { vehicles, settings, toast, deleteVehicles } = useApp()
+  const { settings, toast, refreshSummary } = useApp()
   const u = settings.units
   const nav = useNavigate()
   const [sp, setSp] = useSearchParams()
@@ -46,38 +42,39 @@ export default function Vehicles() {
     setSp(n, { replace: true })
   }
 
-  const filtered = useMemo(() => {
-    const needle = q.trim().toLowerCase()
-    const out = vehicles.filter((v) =>
-      (!status || v.status === status) && (!depot || v.depot === depot) && (!type || v.type === type) &&
-      (!needle || [v.id, v.plate, v.driver ?? '', v.make, v.model, v.location, v.vin].some((f) => f.toLowerCase().includes(needle))))
-    const g = getters[sort] ?? getters.id
-    out.sort((a, b) => {
-      const x = g(a), y = g(b)
-      const r = typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y))
-      return dir === 'asc' ? r : -r
-    })
-    return out
-  }, [vehicles, q, status, depot, type, sort, dir])
-
-  const pages = Math.max(1, Math.ceil(filtered.length / size))
-  const pg = Math.min(page, pages)
-  const rows = filtered.slice((pg - 1) * size, pg * size)
+  // filtering, sorting and pagination happen in PostgreSQL; the URL stays the single source of truth
+  const filterQs = { q: q.trim(), status, depot, type, sort, dir }
+  const list = useApi<ListResponse>(`/vehicles${qs({ ...filterQs, page, size })}`, 250)
+  const data = list.data
+  const rows = data?.items ?? []
+  const total = data?.total ?? 0
+  const fleetTotal = data?.fleetTotal ?? 0
+  const pages = data?.pages ?? 1
+  const pg = data?.page ?? 1
   const pageIds = rows.map((r) => r.id)
   const allOnPage = pageIds.length > 0 && pageIds.every((id) => selected.has(id))
   const someOnPage = pageIds.some((id) => selected.has(id))
-  const counts = Object.fromEntries(STATUSES.map((s) => [s, vehicles.filter((v) => v.status === s).length]))
+  const counts = data?.counts ?? ({} as Record<Status, number>)
+  const [busy, setBusy] = useState(false)
 
   const toggle = (id: string) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n })
   const togglePage = () => setSelected((s) => { const n = new Set(s); pageIds.forEach((id) => (allOnPage ? n.delete(id) : n.add(id))); return n })
 
-  const exportRows = (list: Vehicle[], label: string) => {
-    downloadCSV(`axlework-vehicles-${label}.csv`, toCSV(list.map((v) => ({
-      unit: v.id, plate: v.plate, vin: v.vin, year: v.year, make: v.make, model: v.model, type: v.type, depot: v.depot, driver: v.driver ?? '',
-      status: STATUS_LABEL[v.status], fuel_pct: v.fuelLevel, tank_gal: v.tankGal, [`odometer_${distUnit(u)}`]: Math.round(dist(v.odometer, u)),
-      [effUnit(u).replace('/', '_per_')]: +eff(v.mpg, u).toFixed(1), location: v.location, last_seen: v.lastSeen, open_alerts: v.alerts, gps_imei: v.imei,
-    }))))
-    toast(`Exported ${list.length} vehicle${list.length === 1 ? '' : 's'} as CSV`)
+  const exportRows = async (label: 'filtered' | 'selected') => {
+    try {
+      const params = label === 'selected' ? { ids: [...selected].join(','), sort, dir } : filterQs
+      const n = await download(`/vehicles/export.csv${qs({ ...params, units: u, label })}`, `axlework-vehicles-${label}.csv`)
+      toast(`Exported ${n} vehicle${n === 1 ? '' : 's'} as CSV`)
+    } catch (e) { toast((e as Error).message) }
+  }
+  const removeSelected = async () => {
+    setBusy(true)
+    try {
+      const res = await api<{ deleted: number }>('/vehicles/bulk-delete', { method: 'POST', body: { ids: [...selected] } })
+      toast(`Removed ${res.deleted} vehicles`)
+      setSelected(new Set()); setConfirmDel(false)
+      list.reload(); refreshSummary()
+    } catch (e) { toast((e as Error).message) } finally { setBusy(false) }
   }
 
   const Th = ({ k, children, right = false, className = '' }: { k: SortKey; children: ReactNode; right?: boolean; className?: string }) => {
@@ -98,20 +95,20 @@ export default function Vehicles() {
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="display text-[28px] leading-tight sm:text-[32px]">Vehicles</h1>
-          <p className="mt-1 text-[13px] text-ink-2"><span className="num">{filtered.length}</span> of <span className="num">{vehicles.length}</span> units · click a row for trip, fuel and service history</p>
+          <p className="mt-1 flex items-center gap-2 text-[13px] text-ink-2"><span><span className="num">{total}</span> of <span className="num">{fleetTotal}</span> units · click a row for trip, fuel and service history</span>{list.loading && data && <Spinner className="h-3 w-3" />}</p>
         </div>
         <div className="flex gap-2">
-          <button className="btn-ghost" onClick={() => exportRows(filtered, 'filtered')} disabled={!filtered.length}><IDownload size={16} /> Export CSV</button>
+          <button className="btn-ghost" onClick={() => exportRows('filtered')} disabled={!total}><IDownload size={16} /> Export CSV</button>
           <Link to="/vehicles/new" className="btn-primary"><IPlus size={16} /> Add vehicle</Link>
         </div>
       </div>
 
       {/* status tabs */}
       <div className="mt-5 flex gap-1 overflow-x-auto border-b border-line" role="tablist">
-        {[['', 'All', vehicles.length] as const, ...STATUSES.map((s) => [s, STATUS_LABEL[s], counts[s]] as const)].map(([s, label, n]) => (
+        {[['', 'All', fleetTotal] as const, ...STATUSES.map((s) => [s, STATUS_LABEL[s], counts[s]] as const)].map(([s, label, n]) => (
           <button key={s || 'all'} role="tab" aria-selected={status === s} onClick={() => set({ status: s })}
             className={`-mb-px flex h-10 shrink-0 items-center gap-2 border-b-2 px-3 text-[13px] ${status === s ? 'border-ink font-semibold text-ink' : 'border-transparent text-ink-2 hover:text-ink'}`}>
-            {s && <span className={`h-2 w-2 rounded-full ${STATUS_DOT[s]}`} />}{label}<span className="num text-[11px] text-ink-3">{n}</span>
+            {s && <span className={`h-2 w-2 rounded-full ${STATUS_DOT[s]}`} />}{label}<span className="num text-[11px] text-ink-3">{data ? n ?? 0 : '·'}</span>
           </button>
         ))}
       </div>
@@ -135,9 +132,9 @@ export default function Vehicles() {
           {selected.size > 0 && (
             <div className="flex w-full items-center gap-2 rounded-[5px] bg-ink py-1 pl-3 pr-1 text-bg sm:ml-auto sm:w-auto">
               <span className="text-[12.5px] font-semibold"><span className="num">{selected.size}</span> selected</span>
-              <button className="btn btn-sm text-bg hover:bg-bg/10" onClick={() => exportRows(vehicles.filter((v) => selected.has(v.id)), 'selected')}><IDownload size={14} /> Export</button>
+              <button className="btn btn-sm text-bg hover:bg-bg/10" onClick={() => exportRows('selected')}><IDownload size={14} /> Export</button>
               {confirmDel ? (
-                <button className="btn btn-sm bg-crit text-white" onClick={() => { deleteVehicles([...selected]); toast(`Removed ${selected.size} vehicles`); setSelected(new Set()); setConfirmDel(false) }}>Confirm remove</button>
+                <button className="btn btn-sm bg-crit text-white" disabled={busy} onClick={removeSelected}>{busy ? 'Removing…' : 'Confirm remove'}</button>
               ) : (
                 <button className="btn btn-sm text-bg hover:bg-bg/10" onClick={() => setConfirmDel(true)}><ITrash size={14} /> Remove</button>
               )}
@@ -190,7 +187,13 @@ export default function Vehicles() {
                   </tr>
                 )
               })}
-              {!rows.length && (
+              {!data && list.loading && (
+                <tr><td colSpan={11} className="px-4 py-16 text-center text-ink-2"><span className="inline-flex items-center gap-2"><Spinner />Loading vehicles…</span></td></tr>
+              )}
+              {list.error && (
+                <tr><td colSpan={11} className="px-4 py-16 text-center text-crit" role="alert">{list.error.message} <button className="font-semibold underline" onClick={list.reload}>Retry</button></td></tr>
+              )}
+              {data && !list.error && !rows.length && (
                 <tr><td colSpan={11} className="px-4 py-16 text-center text-ink-2">No vehicles match these filters. <button className="font-semibold underline" onClick={() => setSp(new URLSearchParams(), { replace: true })}>Clear filters</button></td></tr>
               )}
             </tbody>
@@ -204,7 +207,7 @@ export default function Vehicles() {
             <select className="input h-8 w-auto py-0 text-xs" value={size} onChange={(e) => set({ size: e.target.value })} aria-label="Rows per page">
               {[10, 25, 50].map((n) => <option key={n}>{n}</option>)}
             </select>
-            <span className="num">{filtered.length ? (pg - 1) * size + 1 : 0}–{Math.min(pg * size, filtered.length)} of {filtered.length}</span>
+            <span className="num">{total ? (pg - 1) * size + 1 : 0}–{Math.min(pg * size, total)} of {total}</span>
           </div>
           <div className="flex items-center gap-1">
             <button className="btn-ghost btn-sm px-1.5" disabled={pg <= 1} onClick={() => set({ page: pg - 1 }, false)} aria-label="Previous page"><IChevronLeft size={15} /></button>
